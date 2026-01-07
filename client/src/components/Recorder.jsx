@@ -1,144 +1,101 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 
 function Recorder({ onAudioRecorded, isLoading }) {
   const [isRecording, setIsRecording] = useState(false)
-  const [recordingTime, setRecordingTime] = useState(0)
+  const [volume, setVolume] = useState(0)
   const [devices, setDevices] = useState([])
-  const [selectedDeviceId, setSelectedDeviceId] = useState('')
+  const [selectedDevice, setSelectedDevice] = useState('')
 
   const mediaRecorderRef = useRef(null)
-  const chunksRef = useRef([])
-  const timerIntervalRef = useRef(null)
-  const canvasRef = useRef(null)
-  const animationFrameRef = useRef(null)
   const audioContextRef = useRef(null)
-  const analyserRef = useRef(null)
+  const analyzerRef = useRef(null)
+  const animationFrameRef = useRef(null)
   const streamRef = useRef(null)
+  const chunksRef = useRef([])
 
+  // Load available microphones
   useEffect(() => {
+    const getDevices = async () => {
+      try {
+        await navigator.mediaDevices.getUserMedia({ audio: true })
+        const allDevices = await navigator.mediaDevices.enumerateDevices()
+        const mics = allDevices.filter(d => d.kind === 'audioinput')
+        setDevices(mics)
+        if (mics.length > 0) {
+          // Priority to Bluetooth or Headset
+          const bestMic = mics.find(m => m.label.toLowerCase().includes('bluetooth') || m.label.toLowerCase().includes('headset')) || mics[0];
+          setSelectedDevice(bestMic.deviceId)
+        }
+      } catch (err) {
+        console.error("Device detection failed:", err)
+      }
+    }
     getDevices()
-    navigator.mediaDevices.addEventListener('devicechange', getDevices)
+
     return () => {
-      navigator.mediaDevices.removeEventListener('devicechange', getDevices)
+      cancelAnimationFrame(animationFrameRef.current)
+      if (audioContextRef.current) audioContextRef.current.close()
+      if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop())
     }
   }, [])
-
-  const getSupportedMimeType = () => {
-    const types = [
-      'audio/webm;codecs=opus',
-      'audio/webm',
-      'audio/ogg;codecs=opus',
-      'audio/mp4',
-      'audio/aac'
-    ]
-    for (const type of types) {
-      if (MediaRecorder.isTypeSupported(type)) {
-        return type
-      }
-    }
-    return '' // Let browser use default
-  }
-
-  const getDevices = async () => {
-    try {
-      const devs = await navigator.mediaDevices.enumerateDevices()
-      const audioInputs = devs.filter(d => d.kind === 'audioinput')
-      setDevices(audioInputs)
-
-      if (audioInputs.length > 0 && !selectedDeviceId) {
-        setSelectedDeviceId(audioInputs[0].deviceId)
-      }
-    } catch (err) {
-      console.error("Error fetching devices:", err)
-    }
-  }
 
   const startRecording = async () => {
     try {
       const constraints = {
-        audio: selectedDeviceId ? { deviceId: { exact: selectedDeviceId } } : true
+        audio: selectedDevice ? { deviceId: { exact: selectedDevice } } : true
       }
-
       const stream = await navigator.mediaDevices.getUserMedia(constraints)
       streamRef.current = stream
 
-      getDevices()
+      // Volume Meter Setup
+      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)()
+      const source = audioContextRef.current.createMediaStreamSource(stream)
+      analyzerRef.current = audioContextRef.current.createAnalyser()
+      analyzerRef.current.fftSize = 256
+      source.connect(analyzerRef.current)
 
-      const audioContext = new (window.AudioContext || window.webkitAudioContext)()
-      audioContextRef.current = audioContext
-      const analyser = audioContext.createAnalyser()
-      analyser.fftSize = 256
-      analyserRef.current = analyser
-      const source = audioContext.createMediaStreamSource(stream)
-      source.connect(analyser)
+      const updateVolume = () => {
+        if (!analyzerRef.current) return
+        const dataArray = new Uint8Array(analyzerRef.current.frequencyBinCount)
+        analyzerRef.current.getByteFrequencyData(dataArray)
+        const average = dataArray.reduce((p, c) => p + c, 0) / dataArray.length
+        setVolume(Math.min(100, (average / 128) * 100))
+        animationFrameRef.current = requestAnimationFrame(updateVolume)
+      }
+      updateVolume()
 
-      // Start Visualizer
-      drawVisualizer()
-
-      const mimeType = getSupportedMimeType()
-      console.log(`[RECORDER] Using MIME type: ${mimeType}`)
-
-      const options = mimeType ? { mimeType } : {}
-      const mediaRecorder = new MediaRecorder(stream, options)
-
-      mediaRecorderRef.current = mediaRecorder
+      const recorder = new MediaRecorder(stream)
+      mediaRecorderRef.current = recorder
       chunksRef.current = []
 
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          chunksRef.current.push(event.data)
-        }
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunksRef.current.push(e.data)
       }
 
-      mediaRecorder.onstop = () => {
-        const mimeType = mediaRecorder.mimeType || 'audio/webm'
-        const blob = new Blob(chunksRef.current, { type: mimeType })
+      recorder.onstop = () => {
+        const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
 
-        if (blob.size < 3000) {
-          console.warn(`[RECORDER] File too small (${blob.size} bytes). Possibly no audio captured.`)
-          alert("Recording failed or was too short. Please check your microphone selection and speak louder.")
-          // Stop cleanup but don't send file
-          if (streamRef.current) {
-            streamRef.current.getTracks().forEach(track => track.stop())
-          }
-          if (audioContextRef.current) {
-            audioContextRef.current.close()
-          }
-          cancelAnimationFrame(animationFrameRef.current)
-          setIsRecording(false)
+        // Block empty recordings (less than 1KB is usually just header)
+        if (blob.size < 500) {
+          console.error("Recording too short or empty")
+          alert("Capture failed: No audio data detected. Please speak louder or check your mic selection.")
           return
         }
 
-        // Ensure extension matches or server handles it. We'll send as .webm but server detects by mime or content.
-        // Actually best to keep filename generic or extension aligned, but server relies on multer validation which we have.
-        // Let's stick to .webm but sending the correct blob type is crucial.
-        const file = new File([blob], 'recording.webm', { type: mimeType })
-        console.log(`[RECORDER] Recorded ${blob.size} bytes with mime: ${mimeType}`)
+        const file = new File([blob], 'recording.webm', { type: 'audio/webm' })
         onAudioRecorded(file)
 
         // Cleanup
-        if (streamRef.current) {
-          streamRef.current.getTracks().forEach(track => track.stop())
-        }
-        if (audioContextRef.current) {
-          audioContextRef.current.close()
-        }
+        stream.getTracks().forEach(track => track.stop())
         cancelAnimationFrame(animationFrameRef.current)
+        setVolume(0)
       }
 
-      // Request data every 1 second to ensure we capture chunks
-      mediaRecorder.start(1000)
+      recorder.start(100) // Small timeslice to ensure data flows
       setIsRecording(true)
-      setRecordingTime(0)
-      console.log('[RECORDER] Started recording')
-
-      timerIntervalRef.current = setInterval(() => {
-        setRecordingTime(prev => prev + 1)
-      }, 1000)
-
     } catch (err) {
-      console.error('[ERROR] Microphone access error:', err)
-      alert('Microphone access denied. Please allow microphone access.')
+      console.error("Mic Error:", err)
+      alert("Microphone Error: " + err.message)
     }
   }
 
@@ -146,99 +103,64 @@ function Recorder({ onAudioRecorded, isLoading }) {
     if (mediaRecorderRef.current && isRecording) {
       mediaRecorderRef.current.stop()
       setIsRecording(false)
-      clearInterval(timerIntervalRef.current)
-      console.log('[RECORDER] Stopped recording')
     }
-  }
-
-  const drawVisualizer = () => {
-    if (!analyserRef.current || !canvasRef.current) return
-
-    const bufferLength = analyserRef.current.frequencyBinCount
-    const dataArray = new Uint8Array(bufferLength)
-    const canvas = canvasRef.current
-    const canvasCtx = canvas.getContext('2d')
-    const width = canvas.width
-    const height = canvas.height
-
-    const draw = () => {
-      animationFrameRef.current = requestAnimationFrame(draw)
-      analyserRef.current.getByteFrequencyData(dataArray)
-
-      canvasCtx.fillStyle = 'rgb(240, 240, 240)'
-      canvasCtx.fillRect(0, 0, width, height)
-
-      const barWidth = (width / bufferLength) * 2.5
-      let barHeight
-      let x = 0
-
-      for (let i = 0; i < bufferLength; i++) {
-        barHeight = dataArray[i] / 2
-        canvasCtx.fillStyle = `rgb(${barHeight + 100}, 50, 50)`
-        canvasCtx.fillRect(x, height - barHeight, barWidth, barHeight)
-        x += barWidth + 1
-      }
-    }
-
-    draw()
-  }
-
-  const formatTime = (seconds) => {
-    const mins = Math.floor(seconds / 60)
-    const secs = seconds % 60
-    return `${mins}:${secs.toString().padStart(2, '0')}`
   }
 
   return (
-    <div className="input-group">
-      <label>Record audio:</label>
-
-      <div className="device-selection" style={{ marginBottom: '10px' }}>
+    <div className="recorder-container">
+      <div className="mic-selector">
+        <label>🎤 Preferred Mic:</label>
         <select
-          value={selectedDeviceId}
-          onChange={(e) => setSelectedDeviceId(e.target.value)}
+          value={selectedDevice}
+          onChange={(e) => setSelectedDevice(e.target.value)}
           disabled={isRecording}
-          style={{ padding: '5px', borderRadius: '4px', width: '100%' }}
         >
-          {devices.length === 0 && <option value="">Default Microphone</option>}
-          {devices.map(device => (
-            <option key={device.deviceId} value={device.deviceId}>
-              {device.label || `Microphone ${device.deviceId.slice(0, 5)}...`}
-            </option>
+          {devices.map(d => (
+            <option key={d.deviceId} value={d.deviceId}>{d.label || `Unknown Mic (${d.deviceId.slice(0, 5)})`}</option>
           ))}
         </select>
       </div>
 
       <div className="button-group">
-        <button
-          className="btn-submit"
-          onClick={startRecording}
-          disabled={isRecording || isLoading}
-        >
-          Start Recording
-        </button>
-        <button
-          className="btn-stop"
-          onClick={stopRecording}
-          disabled={!isRecording || isLoading}
-        >
-          Stop Recording
-        </button>
+        {!isRecording ? (
+          <button className="btn-start" onClick={startRecording} disabled={isLoading}>
+            Start Capture
+          </button>
+        ) : (
+          <button className="btn-stop" onClick={stopRecording}>
+            Stop & Transcribe
+          </button>
+        )}
       </div>
-      {isRecording && (
-        <div className="status loading" style={{ flexDirection: 'column', alignItems: 'center' }}>
-          <canvas
-            ref={canvasRef}
-            width="200"
-            height="60"
-            style={{ marginBottom: '10px', border: '1px solid #ccc', borderRadius: '4px' }}
-          />
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <span className="recording-indicator"></span>
-            Recording... <span className="timer">{formatTime(recordingTime)}</span>
+
+      <div className="visualizer-panel">
+        <div className={`status-dot ${isRecording ? 'recording' : ''}`}></div>
+        <span className="status-text">{isRecording ? "Listening..." : "Ready"}</span>
+        {isRecording && (
+          <div className="vol-meter">
+            <div className="vol-fill" style={{ width: `${volume}%` }}></div>
           </div>
-        </div>
-      )}
+        )}
+      </div>
+
+      <style>{`
+        .recorder-container { background: #ffffff; padding: 24px; border-radius: 16px; border: 1px solid #e2e8f0; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); margin-bottom: 24px; }
+        .mic-selector { margin-bottom: 20px; }
+        .mic-selector label { display: block; margin-bottom: 8px; font-weight: 600; color: #475569; }
+        .mic-selector select { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #cbd5e1; background: #f8fafc; color: #1e293b; }
+        .button-group { display: flex; justify-content: center; margin-bottom: 20px; }
+        .btn-start { background: #4f46e5; color: white; border: none; padding: 12px 32px; border-radius: 12px; font-weight: 700; cursor: pointer; transition: all 0.2s; box-shadow: 0 4px 14px 0 rgba(79, 70, 229, 0.39); }
+        .btn-start:hover { background: #4338ca; transform: translateY(-1px); }
+        .btn-stop { background: #ef4444; color: white; border: none; padding: 12px 32px; border-radius: 12px; font-weight: 700; cursor: pointer; transition: all 0.2s; box-shadow: 0 4px 14px 0 rgba(239, 68, 68, 0.39); animation: pulse-red 1.5s infinite; }
+        .visualizer-panel { display: flex; align-items: center; gap: 12px; padding: 12px; background: #f1f5f9; border-radius: 12px; }
+        .status-dot { width: 10px; height: 10px; border-radius: 50%; background: #94a3b8; }
+        .status-dot.recording { background: #ef4444; animation: blink 1s infinite; }
+        .status-text { font-size: 14px; font-weight: 600; color: #475569; min-width: 80px; }
+        .vol-meter { flex: 1; height: 8px; background: #cbd5e1; border-radius: 4px; overflow: hidden; }
+        .vol-fill { height: 100%; background: #22c55e; transition: width 0.05s; }
+        @keyframes pulse-red { 0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); } 70% { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); } 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); } }
+        @keyframes blink { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
+      `}</style>
     </div>
   )
 }

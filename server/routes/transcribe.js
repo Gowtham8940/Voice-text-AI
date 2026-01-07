@@ -19,72 +19,87 @@ const storage = multer.diskStorage({
 const upload = multer({ storage });
 
 router.post('/transcribe', upload.single('audio'), async (req, res) => {
+  console.log("-----------------------------------------");
+  console.log(`[RECORDER] Request received at ${new Date().toISOString()}`);
+
   if (!req.file) {
+    console.error('[RECORDER] No file in request!');
     return res.status(400).json({ error: 'No audio file provided' });
   }
 
+  console.log(`[RECORDER] Received file: ${req.file.originalname}`);
+  console.log(`[RECORDER] MIME Type: ${req.file.mimetype}`);
+  console.log(`[RECORDER] File Size: ${(req.file.size / 1024).toFixed(2)} KB`);
+
   // Validate audio format by MIME type and file extension
-  const validMimeTypes = ['audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/mp4', 'audio/webm', 'audio/x-m4a', 'audio/aac', 'audio/flac', 'audio/x-wav', 'audio/x-m4b'];
+  const validMimeTypes = ['audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/mp4', 'audio/webm', 'audio/x-m4a', 'audio/aac', 'audio/flac', 'audio/x-wav', 'audio/x-m4b', 'video/webm', 'application/octet-stream'];
   const validExtensions = ['.mp3', '.wav', '.ogg', '.mp4', '.webm', '.m4a', '.aac', '.flac', '.wma', '.m4b'];
-  
+
   const fileExtension = path.extname(req.file.originalname).toLowerCase();
-  const isValidFormat = validMimeTypes.includes(req.file.mimetype) || validExtensions.includes(fileExtension);
-  
+  const isValidFormat = validMimeTypes.includes(req.file.mimetype) || validExtensions.includes(fileExtension) || req.file.mimetype.includes('audio') || req.file.mimetype.includes('video');
+
   if (!isValidFormat) {
+    console.warn(`[RECORDER] Invalid format blocked: ${req.file.mimetype}`);
     fs.unlinkSync(req.file.path);
-    return res.status(400).json({ error: `Unsupported audio format: ${req.file.mimetype || fileExtension}` });
+    return res.status(400).json({ error: `Unsupported audio format: ${req.file.mimetype}` });
   }
 
   const audioPath = req.file.path;
   const whisperScriptPath = path.join(__dirname, '../whisper/transcribe.py');
 
-  console.log(`[TRANSCRIBE] Processing file: ${req.file.originalname} (${req.file.size} bytes)`);
-
   try {
+    console.log(`[RECORDER] Forwarding to Python Whisper Service...`);
+    const startTime = Date.now();
     const transcribedText = await runWhisper(whisperScriptPath, audioPath);
+    const duration = ((Date.now() - startTime) / 1000).toFixed(2);
 
-    console.log(`[TRANSCRIBE] Success: "${transcribedText}"`);
-    fs.unlinkSync(audioPath);
+    console.log(`[RECORDER] Transcription success in ${duration}s: "${transcribedText}"`);
+    if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
 
     res.json({ text: transcribedText });
   } catch (error) {
-    console.error('[TRANSCRIBE] Error:', error.message);
+    console.error('[RECORDER] Pipeline Error:', error.message);
     if (fs.existsSync(audioPath)) {
       fs.unlinkSync(audioPath);
     }
     res.status(500).json({ error: 'Transcription failed', details: error.message });
   }
+  console.log("-----------------------------------------");
 });
 
-function runWhisper(scriptPath, audioPath) {
-  return new Promise((resolve, reject) => {
-    const python = spawn('C:\\Python314\\python.exe', [scriptPath, audioPath], {
-      timeout: 120000  // 2 minute timeout
-    });
-    let output = '';
-    let errorOutput = '';
+const axios = require('axios');
+const formData = require('form-data');
 
-    python.stdout.on('data', (data) => {
-      output += data.toString();
-    });
+// ...
 
-    python.stderr.on('data', (data) => {
-      errorOutput += data.toString();
-      console.log('[PYTHON STDERR]', data.toString());
-    });
+async function runWhisper(scriptPath, audioPath) {
+  try {
+    const form = new formData();
+    form.append('file', fs.createReadStream(audioPath));
 
-    python.on('close', (code) => {
-      if (code !== 0) {
-        reject(new Error(`Python script failed with code ${code}: ${errorOutput}`));
-      } else {
-        resolve(output.trim());
-      }
+    const response = await axios.post('http://localhost:8000/transcribe', form, {
+      headers: {
+        ...form.getHeaders()
+      },
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity
     });
 
-    python.on('error', (error) => {
-      reject(new Error(`Failed to start Python process: ${error.message}`));
-    });
-  });
+    if (response.data && response.data.text) {
+      return response.data.text;
+    } else {
+      throw new Error('No text returned from Python service');
+    }
+  } catch (error) {
+    console.error('Python Service Error:', error.message);
+    if (error.response) {
+      console.error('Response data:', error.response.data);
+      throw new Error(`Python service failed: ${JSON.stringify(error.response.data)}`);
+    } else if (error.request) {
+      throw new Error('Python service not reachable (is it running?)');
+    }
+    throw error;
+  }
 }
 
 module.exports = router;

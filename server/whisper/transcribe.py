@@ -25,88 +25,57 @@ import tempfile
 
 os.environ['PYTHONWARNINGS'] = 'ignore'
 
+# Check input file
+if not os.path.exists(audio_path):
+    print(f"ERROR: File not found: {audio_path}", file=sys.stderr)
+    sys.exit(1)
+
+input_size = os.path.getsize(audio_path)
+print(f"DEBUG: Input file: {audio_path} ({input_size} bytes)", file=sys.stderr)
+
+if input_size < 1000:
+    print(f"ERROR: Audio file too small ({input_size} bytes)", file=sys.stderr)
+    sys.exit(1)
+
 def convert_to_wav(input_path):
-    """Convert audio to WAV with volume normalization"""
+    """Convert any audio format to WAV"""
     try:
         output_path = tempfile.NamedTemporaryFile(suffix='.wav', delete=False).name
-        result = subprocess.run([
+        subprocess.run([
             'ffmpeg', '-i', input_path,
             '-acodec', 'pcm_s16le',
             '-ar', '16000',
             '-ac', '1',
-            '-af', 'volume=3.0,highpass=f=80,lowpass=f=8000',
-            '-y', '-loglevel', 'info', # Changed to info for more detail
+            '-y', '-loglevel', 'error',
             output_path
-        ], capture_output=True, check=False, timeout=60) # check=False to handle error manually
-
-        if result.returncode != 0:
-             print(f"Warning: FFmpeg failed with code {result.returncode}", file=sys.stderr)
-             print(f"FFmpeg stderr: {result.stderr.decode('utf-8', errors='ignore')}", file=sys.stderr)
-
+        ], capture_output=True, check=True, timeout=60)
         
         if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
-            print(f"DEBUG: Successfully converted to WAV: {os.path.getsize(output_path)} bytes", file=sys.stderr)
+            output_size = os.path.getsize(output_path)
+            print(f"DEBUG: Converted {input_size} → {output_size} bytes", file=sys.stderr)
             return output_path
         else:
-            print(f"Warning: WAV conversion produced invalid file", file=sys.stderr)
-            return input_path
-    except subprocess.TimeoutExpired:
-        print("Warning: FFmpeg conversion timed out", file=sys.stderr)
-        return input_path
+            print(f"ERROR: Conversion produced invalid file", file=sys.stderr)
+            sys.exit(1)
     except Exception as e:
-        print(f"Warning: FFmpeg conversion failed: {e}", file=sys.stderr)
-        return input_path
+        print(f"ERROR: FFmpeg failed: {e}", file=sys.stderr)
+        sys.exit(1)
 
 try:
     wav_path = convert_to_wav(audio_path)
-    print(f"DEBUG: Processing audio file: {wav_path}", file=sys.stderr)
+    print(f"DEBUG: Processing: {wav_path}", file=sys.stderr)
     
-    # Try tiny model first (faster)
-    model = whisper.load_model("tiny")
-    print(f"DEBUG: Model loaded: tiny", file=sys.stderr)
+    model = whisper.load_model("base")
+    print(f"DEBUG: Model loaded", file=sys.stderr)
     
-    result = model.transcribe(
-        wav_path,
-        fp16=False,
-        language="en",  # Specify English to help detection
-        verbose=False,
-        temperature=0.0,
-        compression_ratio_threshold=2.4,
-        logprob_threshold=-1.0,
-        no_speech_threshold=0.05,  # Even more lenient
-        beam_size=5,
-        best_of=5
-    )
+    result = model.transcribe(wav_path, language="en", verbose=False)
     
     transcribed_text = result.get("text", "").strip()
-    print(f"DEBUG: Tiny model result: '{transcribed_text}'", file=sys.stderr)
+    print(f"DEBUG: Transcription: '{transcribed_text}'", file=sys.stderr)
     
-    # Fallback to base model if tiny produced no/minimal results
-    if len(transcribed_text) < 3:
-        print(f"DEBUG: Tiny result too short, trying base model", file=sys.stderr)
-        model = whisper.load_model("base")
-        result = model.transcribe(
-            wav_path,
-            fp16=False,
-            language="en",
-            verbose=False,
-            temperature=0.0,
-            compression_ratio_threshold=2.4,
-            logprob_threshold=-1.0,
-            no_speech_threshold=0.05,
-            beam_size=5,
-            best_of=5
-        )
-        transcribed_text = result.get("text", "").strip()
-        print(f"DEBUG: Base model result: '{transcribed_text}'", file=sys.stderr)
+    if transcribed_text:
+        sys.stdout.write(transcribed_text)
     
-    print(f"DEBUG: Final transcription result: {result}", file=sys.stderr)
-    
-    if not transcribed_text:
-        print("DEBUG: No text detected", file=sys.stderr)
-        print("", end='')
-    else:
-        sys.stdout.write(transcribed_text + '\n')
     sys.stdout.flush()
     
     if wav_path != audio_path and os.path.exists(wav_path):
